@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS metadata
+.DS_Store
+
+# Runtime logs and generated output
+nohup.out
+cortexerror.log
+*.log
+results/
+
+# Fluent cleanup scripts (auto-generated)
+cleanup-fluent-*.sh
