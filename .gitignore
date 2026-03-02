@@ -20,3 +20,4 @@ results/
 
 # Fluent cleanup scripts (auto-generated)
 cleanup-fluent-*.sh
+.claude/
