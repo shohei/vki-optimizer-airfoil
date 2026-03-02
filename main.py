@@ -54,6 +54,7 @@ from postprocessing.visualization import (
     plot_airfoil_gallery,
     plot_convergence,
     plot_pareto_front,
+    plot_pareto_with_airfoils,
 )
 
 
@@ -262,6 +263,7 @@ def main() -> None:
         plot_convergence(result)
         plot_airfoil_gallery(X_pareto, F_pareto, n_show=6)
         export_csv(X_pareto, F_pareto)
+        plot_pareto_with_airfoils()
     else:
         export_csv(X_pareto, F_pareto)
 

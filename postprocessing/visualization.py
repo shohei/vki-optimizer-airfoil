@@ -20,6 +20,7 @@ matplotlib.use("Agg")   # headless rendering (no display required)
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import ConnectionPatch
 
 from geometry.naca4 import naca4_coords, naca_label
 import config
@@ -206,6 +207,105 @@ def plot_convergence(
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"[viz] Convergence history saved → {save_path}")
+
+
+def plot_pareto_with_airfoils(
+    csv_path: str = "results/pareto_solutions.csv",
+    save_path: str = "results/pareto_with_airfoils.png",
+    n_insets: int = 6,
+) -> None:
+    """
+    Pareto front with airfoil profile insets overlaid.
+
+    Reads a pareto_solutions.csv and draws the Pareto front (CD vs CL)
+    with small airfoil insets for evenly-spaced solutions, each connected
+    to its corresponding point by an annotating arrow.
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to the CSV exported by export_csv().
+    save_path : str
+        Output PNG path.
+    n_insets : int
+        Number of airfoil insets to show.
+    """
+    _INSET_W = 0.10
+    _INSET_H = 0.055
+
+    df = pd.read_csv(csv_path)
+    df.sort_values("CL", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    CL        = df["CL"].values
+    CD        = df["CD"].values
+    LD        = df["L_over_D"].values
+    camber    = df["camber"].values
+    thickness = df["thickness"].values
+    labels    = df["NACA_label"].values
+
+    ld_norm = (LD - LD.min()) / (LD.max() - LD.min() + 1e-9)
+    sel_idx = np.linspace(0, len(CL) - 1, n_insets, dtype=int)
+
+    # Inset anchor positions (figure fraction), alternating above/below curve
+    ax_l, ax_b, ax_r, ax_t = 0.10, 0.12, 0.90, 0.90
+    xs = np.linspace(ax_l + 0.01, ax_r - _INSET_W - 0.01, n_insets)
+    inset_positions = [
+        (xs[i], ax_t - _INSET_H - 0.01 if i % 2 == 0 else ax_b + 0.01)
+        for i in range(n_insets)
+    ]
+
+    fig = plt.figure(figsize=(14, 7))
+    ax  = fig.add_axes([ax_l, ax_b, ax_r - ax_l, ax_t - ax_b])
+
+    sc = ax.scatter(CD, CL, c=LD, cmap="plasma", s=55,
+                    zorder=3, edgecolors="k", linewidths=0.4)
+    ax.plot(CD, CL, "--", color="grey", lw=0.8, zorder=2, alpha=0.5)
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.01)
+    cbar.set_label("L/D = CL / CD", fontsize=10)
+
+    ax.set_xlabel("Drag coefficient  CD", fontsize=12)
+    ax.set_ylabel("Lift coefficient  CL", fontsize=12)
+    ax.set_title("Pareto Front with Airfoil Profiles", fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.scatter(CD[sel_idx], CL[sel_idx], s=120, zorder=4,
+               facecolors="none", edgecolors="white", linewidths=1.5)
+
+    for k, idx in enumerate(sel_idx):
+        color = cm.plasma(ld_norm[idx])
+        xu, yu, xl, yl = naca4_coords(camber[idx], 0.40, thickness[idx], n_points=120)
+
+        ix, iy = inset_positions[k]
+        ax_in = fig.add_axes([ix, iy, _INSET_W, _INSET_H])
+        ax_in.fill_between(xu, yu, xl, alpha=0.30, color=color)
+        ax_in.plot(xu, yu, "-", color=color, lw=1.2)
+        ax_in.plot(xl, yl, "-", color=color, lw=1.2)
+        ax_in.set_xlim(-0.05, 1.05)
+        ax_in.set_ylim(-0.18, 0.28)
+        ax_in.set_aspect("equal")
+        ax_in.axis("off")
+
+        label_str = f"{labels[idx]}\nCL={CL[idx]:.3f}  CD={CD[idx]:.4f}\nL/D={LD[idx]:.1f}"
+        y_text  = -0.05 if (k % 2 == 0) else 1.05
+        v_align = "top"  if (k % 2 == 0) else "bottom"
+        ax_in.text(0.5, y_text, label_str,
+                   ha="center", va=v_align, fontsize=6.5,
+                   transform=ax_in.transAxes, color=color,
+                   bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=1))
+
+        inset_cx = ix + _INSET_W / 2
+        inset_cy = iy if (k % 2 == 0) else iy + _INSET_H
+        fig.add_artist(ConnectionPatch(
+            xyA=(inset_cx, inset_cy), xyB=(CD[idx], CL[idx]),
+            coordsA="figure fraction", coordsB="data",
+            axesA=None, axesB=ax,
+            color=color, lw=0.9, arrowstyle="-|>", mutation_scale=8, zorder=5,
+        ))
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[viz] Pareto + airfoils saved → {save_path}")
 
 
 def plot_surrogate_accuracy(
