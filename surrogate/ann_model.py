@@ -99,9 +99,11 @@ class ANNSurrogate:
 
         self._model_CL = self._make_mlp()
         self._model_CL.fit(X_scaled, CL_scaled)
+        self.loss_curve_CL_: list[float] = list(self._model_CL.loss_curve_)
 
         self._model_CD = self._make_mlp()
         self._model_CD.fit(X_scaled, CD_scaled)
+        self.loss_curve_CD_: list[float] = list(self._model_CD.loss_curve_)
 
         # Evaluate on training data
         CL_pred, CD_pred = self.predict(X)

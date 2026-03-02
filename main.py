@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
                         help="Skip generating plots (useful for CI/CD)")
     parser.add_argument("--restart", action="store_true",
                         help="Ignore checkpoint and restart optimisation from scratch")
+    parser.add_argument("--animate", action="store_true",
+                        help="Save workflow animation GIF to results/workflow_animation.gif")
     return parser.parse_args()
 
 
@@ -205,6 +207,8 @@ def main() -> None:
     # ── Create output directory ───────────────────────────────────────────────
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
 
+    surrogate = None   # populated in surrogate mode; used by --animate
+
     # ── Surrogate mode (DoE → ANN → NSGA-II [→ Infill]) ──────────────────────
     if args.surrogate:
         from doe.sampler import run_doe
@@ -266,6 +270,15 @@ def main() -> None:
         plot_pareto_with_airfoils()
     else:
         export_csv(X_pareto, F_pareto)
+
+    if args.animate:
+        from postprocessing.animation import animate_workflow
+        animate_workflow(
+            nsga_result=result,
+            doe_csv=config.DOE_CSV if args.surrogate else None,
+            surrogate=surrogate if args.surrogate else None,
+            save_path="results/workflow_animation.gif",
+        )
 
     print(f"\nAll results written to: {os.path.abspath(config.RESULTS_DIR)}/")
 
