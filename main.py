@@ -124,7 +124,13 @@ def run_infill(result, surrogate, use_mock: bool, verbose: bool):
 
     Returns
     -------
-    pymoo Result (from the refined NSGA-II run)
+    result_refined : pymoo Result (from the refined NSGA-II run)
+    infill_data : dict
+        Animation / diagnostic data:
+          X_cand          – (n, 3) design variables of selected candidates
+          CL_ann, CD_ann  – ANN predictions before CFD re-evaluation
+          CL_cfd, CD_cfd  – real CFD results
+          loss_cl_retrain, loss_cd_retrain – loss curves after retraining
     """
     X_pareto, F_pareto = extract_pareto(result)
     n_cand = min(config.INFILL_N_CANDIDATES, len(X_pareto))
@@ -135,6 +141,9 @@ def run_infill(result, surrogate, use_mock: bool, verbose: bool):
     LD_p = CL_p / np.where(CD_p > 1e-9, CD_p, np.nan)
     idx_top = np.argsort(-np.nan_to_num(LD_p))[:n_cand]
     X_cand = X_pareto[idx_top]
+
+    # Capture ANN predictions BEFORE CFD re-evaluation
+    CL_ann, CD_ann = surrogate.predict(X_cand)
 
     print(f"\n[infill] Re-evaluating {n_cand} Pareto candidates with real CFD …")
 
@@ -152,6 +161,9 @@ def run_infill(result, surrogate, use_mock: bool, verbose: bool):
         if verbose:
             print(f"[infill]   {i+1}/{n_cand}  α={x[0]:.2f}°  "
                   f"CL={CL_new[i]:.4f}  CD={CD_new[i]:.5f}")
+
+    loss_cl_retrain: list = []
+    loss_cd_retrain: list = []
 
     if config.INFILL_RETRAIN:
         # Retrieve the original DoE data stored in the CSV and append infill points
@@ -173,6 +185,8 @@ def run_infill(result, surrogate, use_mock: bool, verbose: bool):
         print(f"[infill] Retraining surrogate on {len(X_aug)} samples …")
         surrogate.fit(X_aug, CL_aug, CD_aug)
         surrogate.save(config.ANN_SAVE_PATH)
+        loss_cl_retrain = list(getattr(surrogate, "loss_curve_CL_", []))
+        loss_cd_retrain = list(getattr(surrogate, "loss_curve_CD_", []))
 
     print("[infill] Re-running NSGA-II with refined surrogate …")
     result_refined = run_nsga2(
@@ -181,7 +195,17 @@ def run_infill(result, surrogate, use_mock: bool, verbose: bool):
         verbose=verbose,
         restart=True,
     )
-    return result_refined
+
+    infill_data = {
+        "X_cand":          X_cand,
+        "CL_ann":          CL_ann,
+        "CD_ann":          CD_ann,
+        "CL_cfd":          CL_new,
+        "CD_cfd":          CD_new,
+        "loss_cl_retrain": loss_cl_retrain,
+        "loss_cd_retrain": loss_cd_retrain,
+    }
+    return result_refined, infill_data
 
 
 def main() -> None:
@@ -207,7 +231,9 @@ def main() -> None:
     # ── Create output directory ───────────────────────────────────────────────
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
 
-    surrogate = None   # populated in surrogate mode; used by --animate
+    surrogate         = None   # populated in surrogate mode; used by --animate
+    result_pre_infill = None   # Phase 3 result saved before infill overwrites it
+    infill_data       = None   # dict of infill diagnostics for animation
 
     # ── Surrogate mode (DoE → ANN → NSGA-II [→ Infill]) ──────────────────────
     if args.surrogate:
@@ -248,8 +274,17 @@ def main() -> None:
         )
 
         # Phase 4: Infill (optional)
+        result_pre_infill = None
+        infill_data       = None
         if args.infill:
-            result = run_infill(result, surrogate, use_mock=use_mock, verbose=True)
+            # Save Phase 2 loss curves before retraining overwrites them
+            infill_data = {
+                "loss_cl_phase2": list(getattr(surrogate, "loss_curve_CL_", [])),
+                "loss_cd_phase2": list(getattr(surrogate, "loss_curve_CD_", [])),
+            }
+            result_pre_infill = result
+            result, _idata = run_infill(result, surrogate, use_mock=use_mock, verbose=True)
+            infill_data.update(_idata)
 
     else:
         # ── Standard mode (direct CFD) ────────────────────────────────────────
@@ -274,9 +309,11 @@ def main() -> None:
     if args.animate:
         from postprocessing.animation import animate_workflow
         animate_workflow(
-            nsga_result=result,
+            nsga_result=result_pre_infill if result_pre_infill is not None else result,
+            nsga_result_infill=result if result_pre_infill is not None else None,
             doe_csv=config.DOE_CSV if args.surrogate else None,
             surrogate=surrogate if args.surrogate else None,
+            infill_data=infill_data,
             save_path="results/workflow_animation.gif",
         )
 

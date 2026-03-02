@@ -1,13 +1,18 @@
 """
-Workflow animation for the DoE → ANN → NSGA-II optimisation pipeline.
+Workflow animation for the DoE → ANN → NSGA-II → Infill pipeline.
 
-Produces a 4-panel animated GIF:
-  Top-left     Phase 1 · DoE LHS samples appearing in design space
-  Top-right    Phase 2 · ANN training loss curves (CL and CD)
-  Bottom-left  Phase 3 · NSGA-II Pareto front evolving generation by generation
-  Bottom-right Phase 3 · Convergence history (max CL, min CD per generation)
+4-panel dark-theme animated GIF across up to 6 phases:
 
-When surrogate data is unavailable only Phase 3 is shown (2-panel layout).
+  Phase 1  (top-left)   DoE LHS samples appearing in design space
+  Phase 2  (top-right)  ANN training loss curves
+  Phase 3  (bottom)     NSGA-II Pareto front evolving + convergence history
+  Phase 4a (bottom-left) Infill: top Pareto candidates highlighted
+  Phase 4b (top-left + bottom-left) Infill: ANN prediction vs CFD result
+  Phase 4c (top-right)  Infill: retrained ANN loss curves
+  Phase 4d (bottom)     Refined NSGA-II Pareto front + convergence
+
+Phases 4a-4d are only rendered when nsga_result_infill and infill_data
+are provided.
 """
 
 from __future__ import annotations
@@ -26,14 +31,16 @@ import config
 
 
 # ─── Dark colour palette ──────────────────────────────────────────────────────
-_BG_FIG  = "#0f0f1a"
-_BG_AX   = "#16213e"
-_SPINE   = "#2a2a4a"
-_WHITE   = "#e8e8f0"
-_MUTED   = "#8888aa"
-_ACCENT1 = "#ff6b6b"   # CL / warm
-_ACCENT2 = "#4ecdc4"   # CD / cool
-_GOLD    = "#ffd166"   # Pareto points
+_BG_FIG   = "#0f0f1a"
+_BG_AX    = "#16213e"
+_SPINE    = "#2a2a4a"
+_WHITE    = "#e8e8f0"
+_MUTED    = "#8888aa"
+_ACCENT1  = "#ff6b6b"   # CL / warm
+_ACCENT2  = "#4ecdc4"   # CD / cool
+_GOLD     = "#ffd166"   # Pareto points
+_INFILL_C = "#ff3399"   # infill highlight colour
+_RETRAIN  = "#aaffaa"   # retrained ANN colour
 
 
 def _style_ax(ax) -> None:
@@ -43,10 +50,18 @@ def _style_ax(ax) -> None:
         sp.set_edgecolor(_SPINE)
 
 
+def _subsample(arr: np.ndarray, max_frames: int) -> tuple[np.ndarray, int]:
+    """Return subsampled array and the step size used."""
+    step = max(1, len(arr) // max_frames)
+    return arr[::step], step
+
+
 def animate_workflow(
     nsga_result,
     doe_csv: str | None = None,
     surrogate=None,
+    infill_data: dict | None = None,
+    nsga_result_infill=None,
     save_path: str = "results/workflow_animation.gif",
     fps: int = 15,
 ) -> None:
@@ -56,21 +71,27 @@ def animate_workflow(
     Parameters
     ----------
     nsga_result : pymoo Result
-        Must have been created with ``save_history=True``.
+        Phase 3 NSGA-II result (save_history=True).
     doe_csv : str | None
-        Path to DoE CSV (Phase 1 panel).  Skipped when None.
+        Path to DoE CSV for Phase 1 panel.
     surrogate : ANNSurrogate | None
-        Trained surrogate with ``loss_curve_CL_`` / ``loss_curve_CD_``
-        attributes (Phase 2 panel).  Skipped when None.
+        Fitted surrogate; loss_curve_CL_/CD_ used for Phase 2
+        (unless overridden by infill_data["loss_cl_phase2"]).
+    infill_data : dict | None
+        Dict returned by run_infill(); keys: X_cand, CL_ann, CD_ann,
+        CL_cfd, CD_cfd, loss_cl_phase2, loss_cd_phase2,
+        loss_cl_retrain, loss_cd_retrain.
+    nsga_result_infill : pymoo Result | None
+        Phase 4d refined NSGA-II result (save_history=True).
     save_path : str
-        Output GIF path.
     fps : int
-        Frames per second.
     """
-    has_doe = doe_csv is not None and os.path.exists(doe_csv)
-    has_ann = surrogate is not None and hasattr(surrogate, "loss_curve_CL_")
 
-    # ── Collect DoE data ──────────────────────────────────────────────────────
+    # ── Flags ─────────────────────────────────────────────────────────────────
+    has_doe    = doe_csv is not None and os.path.exists(doe_csv)
+    has_infill = infill_data is not None and nsga_result_infill is not None
+
+    # ── Phase 1: DoE data ─────────────────────────────────────────────────────
     if has_doe:
         df_doe     = pd.read_csv(doe_csv)
         doe_camber = df_doe["camber"].values
@@ -81,188 +102,259 @@ def animate_workflow(
     else:
         n_doe = 0
 
-    # ── Collect ANN loss data ─────────────────────────────────────────────────
-    if has_ann:
-        _MAX_ANN_FRAMES = 80
-        loss_cl_raw = np.array(surrogate.loss_curve_CL_)
-        loss_cd_raw = np.array(surrogate.loss_curve_CD_)
-        step = max(1, len(loss_cl_raw) // _MAX_ANN_FRAMES)
-        loss_cl = loss_cl_raw[::step]
-        loss_cd = loss_cd_raw[::step]
-        n_ann   = len(loss_cl)
-        r2_cl   = getattr(surrogate, "_r2_cl", None)
+    # ── Phase 2: ANN loss curves ──────────────────────────────────────────────
+    _MAX_ANN = 80
+    # Use pre-infill loss curves if available; fall back to surrogate attribute
+    if has_infill and "loss_cl_phase2" in infill_data:
+        _raw_cl_p2 = np.array(infill_data["loss_cl_phase2"])
+        _raw_cd_p2 = np.array(infill_data["loss_cd_phase2"])
+    elif surrogate is not None and hasattr(surrogate, "loss_curve_CL_"):
+        _raw_cl_p2 = np.array(surrogate.loss_curve_CL_)
+        _raw_cd_p2 = np.array(surrogate.loss_curve_CD_)
     else:
-        n_ann = 0
+        _raw_cl_p2 = np.array([])
+        _raw_cd_p2 = np.array([])
 
-    # ── Collect NSGA-II history ───────────────────────────────────────────────
-    gen_pareto: list[tuple[np.ndarray, np.ndarray]] = []
-    gen_best_cl: list[float] = []
-    gen_best_cd: list[float] = []
+    has_ann = len(_raw_cl_p2) > 0
+    if has_ann:
+        p2_loss_cl, _p2_step = _subsample(_raw_cl_p2, _MAX_ANN)
+        p2_loss_cd, _        = _subsample(_raw_cd_p2, _MAX_ANN)
+        n_p2 = len(p2_loss_cl)
+    else:
+        n_p2 = 0
 
+    # ── Phase 3: NSGA-II history ──────────────────────────────────────────────
+    gen3_pareto: list[tuple[np.ndarray, np.ndarray]] = []
+    gen3_best_cl: list[float] = []
+    gen3_best_cd: list[float] = []
     for snap in (nsga_result.history or []):
-        F_raw = snap.pop.get("F")                       # (pop, 2): [-CL, CD]
-        gen_best_cl.append(float(-np.min(F_raw[:, 0])))
-        gen_best_cd.append(float(np.min(F_raw[:, 1])))
-
+        F_raw = snap.pop.get("F")
+        gen3_best_cl.append(float(-np.min(F_raw[:, 0])))
+        gen3_best_cd.append(float(np.min(F_raw[:, 1])))
         opt = snap.opt
         if opt is not None and len(opt) > 0:
             F_opt = opt.get("F")
-            gen_pareto.append((-F_opt[:, 0], F_opt[:, 1]))
+            gen3_pareto.append((-F_opt[:, 0], F_opt[:, 1]))
         else:
-            gen_pareto.append((np.array([]), np.array([])))
+            gen3_pareto.append((np.array([]), np.array([])))
+    n_gen3 = len(gen3_pareto)
 
-    n_gen = len(gen_pareto)
+    # ── Phase 4: Infill data ──────────────────────────────────────────────────
+    if has_infill:
+        X_cand  = infill_data["X_cand"]
+        CL_ann  = infill_data["CL_ann"]
+        CD_ann  = infill_data["CD_ann"]
+        CL_cfd  = infill_data["CL_cfd"]
+        CD_cfd  = infill_data["CD_cfd"]
+        n_cand  = len(X_cand)
 
-    # ── Frame budget ──────────────────────────────────────────────────────────
-    # DoE: show 2 samples per frame to keep runtime short
+        _raw_cl_r4 = np.array(infill_data.get("loss_cl_retrain", []))
+        _raw_cd_r4 = np.array(infill_data.get("loss_cd_retrain", []))
+        has_retrain = len(_raw_cl_r4) > 0
+        if has_retrain:
+            p4c_loss_cl, _p4c_step = _subsample(_raw_cl_r4, _MAX_ANN)
+            p4c_loss_cd, _         = _subsample(_raw_cd_r4, _MAX_ANN)
+            n_p4c = len(p4c_loss_cl)
+        else:
+            n_p4c = 0
+
+        gen4_pareto: list[tuple[np.ndarray, np.ndarray]] = []
+        gen4_best_cl: list[float] = []
+        gen4_best_cd: list[float] = []
+        for snap in (nsga_result_infill.history or []):
+            F_raw = snap.pop.get("F")
+            gen4_best_cl.append(float(-np.min(F_raw[:, 0])))
+            gen4_best_cd.append(float(np.min(F_raw[:, 1])))
+            opt = snap.opt
+            if opt is not None and len(opt) > 0:
+                F_opt = opt.get("F")
+                gen4_pareto.append((-F_opt[:, 0], F_opt[:, 1]))
+            else:
+                gen4_pareto.append((np.array([]), np.array([])))
+        n_gen4 = len(gen4_pareto)
+    else:
+        n_cand = n_p4c = n_gen4 = 0
+        has_retrain = False
+
+    # ── Frame boundaries ──────────────────────────────────────────────────────
     _DOE_PER_FRAME = 2
     n_doe_frames = (n_doe + _DOE_PER_FRAME - 1) // _DOE_PER_FRAME if has_doe else 0
-    n_ann_frames = n_ann
-    n_gen_frames = n_gen
-    total        = n_doe_frames + n_ann_frames + n_gen_frames
 
-    # Frame boundary indices
-    _P1_END = n_doe_frames
-    _P2_END = _P1_END + n_ann_frames
+    _P1_END  = n_doe_frames
+    _P2_END  = _P1_END  + n_p2
+    _P3_END  = _P2_END  + n_gen3
+    _P4a_END = _P3_END  + n_cand          # candidates highlighted one-by-one
+    _P4b_END = _P4a_END + n_cand          # CFD evaluation one-by-one
+    _P4c_END = _P4b_END + n_p4c           # ANN retraining
+    total    = _P4c_END + n_gen4          # refined NSGA-II
 
-    # ── Figure / axes setup ───────────────────────────────────────────────────
-    if has_doe or has_ann:
-        fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-        ax_doe, ax_ann   = axes[0, 0], axes[0, 1]
-        ax_par, ax_conv  = axes[1, 0], axes[1, 1]
-        _style_ax(ax_doe); _style_ax(ax_ann)
+    # ── Axis bounds helpers ───────────────────────────────────────────────────
+    def _pareto_bounds(gen_list):
+        all_cl = np.concatenate([cl for cl, _ in gen_list if len(cl)] or [np.array([0.3, 2.0])])
+        all_cd = np.concatenate([cd for _, cd in gen_list if len(cd)] or [np.array([0.005, 0.06])])
+        cd_pad = (all_cd.max() - all_cd.min()) * 0.18 + 1e-4
+        cl_pad = (all_cl.max() - all_cl.min()) * 0.18 + 1e-3
+        return (all_cd.min() - cd_pad, all_cd.max() + cd_pad,
+                all_cl.min() - cl_pad, all_cl.max() + cl_pad)
+
+    cd_lo3, cd_hi3, cl_lo3, cl_hi3 = _pareto_bounds(gen3_pareto)
+    if has_infill:
+        # Combine both runs so axes stay stable across Phase 3 and 4d
+        cd_lo4, cd_hi4, cl_lo4, cl_hi4 = _pareto_bounds(gen4_pareto)
+        cd_lo_par = min(cd_lo3, cd_lo4)
+        cd_hi_par = max(cd_hi3, cd_hi4)
+        cl_lo_par = min(cl_lo3, cl_lo4)
+        cl_hi_par = max(cl_hi3, cl_hi4)
     else:
-        fig, axes_1d = plt.subplots(1, 2, figsize=(13, 5))
-        ax_par, ax_conv = axes_1d[0], axes_1d[1]
-        ax_doe = ax_ann = None
+        cd_lo_par, cd_hi_par, cl_lo_par, cl_hi_par = cd_lo3, cd_hi3, cl_lo3, cl_hi3
 
+    # ── Figure / axes ─────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
     fig.patch.set_facecolor(_BG_FIG)
-    _style_ax(ax_par); _style_ax(ax_conv)
+    ax_doe, ax_ann = axes[0, 0], axes[0, 1]
+    ax_par, ax_conv = axes[1, 0], axes[1, 1]
+    for ax in (ax_doe, ax_ann, ax_par, ax_conv):
+        _style_ax(ax)
 
-    phase_lbl = fig.text(
-        0.5, 0.97, "", ha="center", va="top",
-        fontsize=12, color=_WHITE, fontweight="bold",
-    )
+    phase_lbl = fig.text(0.5, 0.97, "", ha="center", va="top",
+                         fontsize=12, color=_WHITE, fontweight="bold")
 
-    # ── Panel: DoE ────────────────────────────────────────────────────────────
-    if ax_doe is not None and has_doe:
-        ax_doe.set_title("Phase 1 · DoE Sampling (LHS)",
-                         color=_WHITE, fontsize=10, fontweight="bold")
-        ax_doe.set_xlabel("Camber", color=_MUTED, fontsize=8)
-        ax_doe.set_ylabel("Thickness", color=_MUTED, fontsize=8)
-        ax_doe.set_xlim(config.CAMBER_MIN - 0.002, config.CAMBER_MAX + 0.002)
-        ax_doe.set_ylim(config.THICKNESS_MIN - 0.005, config.THICKNESS_MAX + 0.005)
-        ax_doe.grid(True, alpha=0.12, color=_WHITE)
+    # ── Panel: DoE (top-left) ─────────────────────────────────────────────────
+    ax_doe.set_title("Phase 1 · DoE Sampling (LHS)", color=_WHITE,
+                     fontsize=10, fontweight="bold")
+    ax_doe.set_xlabel("Camber",    color=_MUTED, fontsize=8)
+    ax_doe.set_ylabel("Thickness", color=_MUTED, fontsize=8)
+    ax_doe.set_xlim(config.CAMBER_MIN    - 0.002, config.CAMBER_MAX    + 0.002)
+    ax_doe.set_ylim(config.THICKNESS_MIN - 0.005, config.THICKNESS_MAX + 0.005)
+    ax_doe.grid(True, alpha=0.12, color=_WHITE)
 
-        # Initialise scatter with full data (size=0) so colorbar can be set up
+    if has_doe:
+        # Initialise scatter with full extent so colorbar works; sizes start at 0
         scat_doe = ax_doe.scatter(
             doe_camber, doe_thick, c=doe_CL,
             cmap="plasma", vmin=cl_vmin, vmax=cl_vmax,
-            s=np.zeros(n_doe), edgecolors="none",
+            s=np.zeros(n_doe), edgecolors="none", zorder=3,
         )
-        cbar = fig.colorbar(scat_doe, ax=ax_doe, fraction=0.04, pad=0.02)
-        cbar.set_label("CL", color=_MUTED, fontsize=8)
-        cbar.ax.yaxis.set_tick_params(color=_MUTED, labelcolor=_MUTED, labelsize=7)
-
-        doe_count = ax_doe.text(
-            0.97, 0.03, "", transform=ax_doe.transAxes,
-            ha="right", va="bottom", fontsize=8, color=_ACCENT2,
-        )
+        cbar_doe = fig.colorbar(scat_doe, ax=ax_doe, fraction=0.04, pad=0.02)
+        cbar_doe.set_label("CL", color=_MUTED, fontsize=8)
+        cbar_doe.ax.yaxis.set_tick_params(color=_MUTED, labelcolor=_MUTED, labelsize=7)
     else:
-        scat_doe = doe_count = None
+        scat_doe = None
 
-    if ax_doe is not None and not has_doe:
-        ax_doe.set_visible(False)
+    doe_count_lbl = ax_doe.text(0.97, 0.03, "", transform=ax_doe.transAxes,
+                                ha="right", va="bottom", fontsize=8, color=_ACCENT2)
 
-    # ── Panel: ANN training loss ──────────────────────────────────────────────
-    if ax_ann is not None and has_ann:
-        ax_ann.set_title("Phase 2 · ANN Training Loss",
-                         color=_WHITE, fontsize=10, fontweight="bold")
-        ax_ann.set_xlabel("Epoch", color=_MUTED, fontsize=8)
-        ax_ann.set_ylabel("Loss (log)", color=_MUTED, fontsize=8)
-        ax_ann.set_yscale("log")
-        ax_ann.set_xlim(0, n_ann)
-        _all_loss = np.concatenate([loss_cl, loss_cd])
-        ax_ann.set_ylim(_all_loss.min() * 0.4, _all_loss.max() * 2.5)
-        ax_ann.grid(True, alpha=0.12, color=_WHITE)
+    # Infill candidates on DoE panel (Phase 4b) – stars, initially invisible
+    scat_infill_doe = ax_doe.scatter(
+        [], [], marker="*", s=180, c=[], cmap="autumn",
+        vmin=0.5, vmax=2.0, zorder=5, edgecolors=_WHITE, linewidths=0.5,
+    )
 
-        line_cl, = ax_ann.plot([], [], color=_ACCENT1, lw=1.8, label="CL model")
-        line_cd, = ax_ann.plot([], [], color=_ACCENT2, lw=1.8, label="CD model")
-        ax_ann.legend(fontsize=8, facecolor=_BG_AX, edgecolor=_SPINE,
-                      labelcolor=_WHITE, loc="upper right")
-        ann_lbl = ax_ann.text(
-            0.97, 0.95, "", transform=ax_ann.transAxes,
-            ha="right", va="top", fontsize=8, color=_ACCENT2,
-        )
-    else:
-        line_cl = line_cd = ann_lbl = None
+    # ── Panel: ANN training (top-right) ───────────────────────────────────────
+    ax_ann.set_title("Phase 2 · ANN Training Loss", color=_WHITE,
+                     fontsize=10, fontweight="bold")
+    ax_ann.set_xlabel("Epoch", color=_MUTED, fontsize=8)
+    ax_ann.set_ylabel("Loss (log)", color=_MUTED, fontsize=8)
+    ax_ann.set_yscale("log")
+    ax_ann.grid(True, alpha=0.12, color=_WHITE)
 
-    if ax_ann is not None and not has_ann:
-        ax_ann.set_visible(False)
+    if has_ann:
+        _all_p2 = np.concatenate([p2_loss_cl, p2_loss_cd])
+        ax_ann.set_xlim(0, n_p2)
+        ax_ann.set_ylim(_all_p2.min() * 0.4, _all_p2.max() * 2.5)
 
-    # ── Panel: Pareto front ───────────────────────────────────────────────────
-    ax_par.set_title("Phase 3 · NSGA-II Pareto Front",
-                     color=_WHITE, fontsize=10, fontweight="bold")
+    line_p2_cl, = ax_ann.plot([], [], color=_ACCENT1, lw=1.8, label="CL  (init)")
+    line_p2_cd, = ax_ann.plot([], [], color=_ACCENT2, lw=1.8, label="CD  (init)")
+    # Retrained loss curves (Phase 4c) – different style, initially empty
+    line_r4_cl, = ax_ann.plot([], [], color=_RETRAIN, lw=1.8, ls="--",
+                               alpha=0.0, label="CL  (retrained)")
+    line_r4_cd, = ax_ann.plot([], [], color="#ffdd88", lw=1.8, ls="--",
+                               alpha=0.0, label="CD  (retrained)")
+    ann_epoch_lbl = ax_ann.text(0.97, 0.95, "", transform=ax_ann.transAxes,
+                                ha="right", va="top", fontsize=8, color=_ACCENT2)
+    leg_ann = ax_ann.legend(fontsize=7, facecolor=_BG_AX, edgecolor=_SPINE,
+                             labelcolor=_WHITE, loc="upper right")
+
+    # ── Panel: Pareto front (bottom-left) ─────────────────────────────────────
+    ax_par.set_title("Phase 3 · NSGA-II Pareto Front", color=_WHITE,
+                     fontsize=10, fontweight="bold")
     ax_par.set_xlabel("CD", color=_MUTED, fontsize=8)
     ax_par.set_ylabel("CL", color=_MUTED, fontsize=8)
+    ax_par.set_xlim(cd_lo_par, cd_hi_par)
+    ax_par.set_ylim(cl_lo_par, cl_hi_par)
     ax_par.grid(True, alpha=0.12, color=_WHITE)
 
-    _all_cl_flat = np.concatenate(
-        [cl for cl, _ in gen_pareto if len(cl) > 0] or [np.array([0.3, 2.0])]
-    )
-    _all_cd_flat = np.concatenate(
-        [cd for _, cd in gen_pareto if len(cd) > 0] or [np.array([0.005, 0.06])]
-    )
-    _cd_pad = (_all_cd_flat.max() - _all_cd_flat.min()) * 0.15 + 1e-4
-    _cl_pad = (_all_cl_flat.max() - _all_cl_flat.min()) * 0.15 + 1e-3
-    ax_par.set_xlim(_all_cd_flat.min() - _cd_pad, _all_cd_flat.max() + _cd_pad)
-    ax_par.set_ylim(_all_cl_flat.min() - _cl_pad, _all_cl_flat.max() + _cl_pad)
+    cl_vmax_par = max(gen3_best_cl + (gen4_best_cl if has_infill else [])) if gen3_best_cl else 2.0
 
-    par_line, = ax_par.plot([], [], "--", color="#555577", lw=0.8, zorder=2)
-    par_scat  = ax_par.scatter([], [], c=[], cmap="plasma", s=45, zorder=3,
-                                edgecolors=_WHITE, linewidths=0.3,
-                                vmin=0, vmax=max(gen_best_cl) if gen_best_cl else 2)
-    gen_lbl = ax_par.text(
-        0.03, 0.97, "", transform=ax_par.transAxes,
-        ha="left", va="top", fontsize=9, color=_GOLD, fontweight="bold",
-    )
+    # Phase 3 Pareto artists
+    par3_line, = ax_par.plot([], [], "--", color="#555577", lw=0.8, zorder=2)
+    par3_scat  = ax_par.scatter([], [], c=[], cmap="plasma", s=45, zorder=3,
+                                 edgecolors=_WHITE, linewidths=0.3,
+                                 vmin=0, vmax=cl_vmax_par)
+    gen3_lbl = ax_par.text(0.03, 0.97, "", transform=ax_par.transAxes,
+                            ha="left", va="top", fontsize=9,
+                            color=_GOLD, fontweight="bold")
 
-    # ── Panel: Convergence history ────────────────────────────────────────────
-    ax_conv.set_title("Phase 3 · Convergence History",
-                      color=_WHITE, fontsize=10, fontweight="bold")
+    # Phase 4 infill artists (initially invisible)
+    # Hollow diamond = ANN prediction, filled star = CFD result
+    scat_cand_ann = ax_par.scatter([], [], marker="D", s=100, zorder=6,
+                                    facecolors="none", edgecolors=_INFILL_C,
+                                    linewidths=1.8)
+    scat_cand_cfd = ax_par.scatter([], [], marker="*", s=160, zorder=7,
+                                    c=[], cmap="autumn", vmin=0.5, vmax=cl_vmax_par,
+                                    edgecolors=_WHITE, linewidths=0.4)
+
+    # Phase 4d Pareto artists (overlay refined run)
+    par4_line, = ax_par.plot([], [], "--", color="#ff9966", lw=0.8, zorder=4,
+                              alpha=0.0)
+    par4_scat  = ax_par.scatter([], [], c=[], cmap="inferno", s=45, zorder=5,
+                                 edgecolors=_WHITE, linewidths=0.3, alpha=0.0,
+                                 vmin=0, vmax=cl_vmax_par)
+    gen4_lbl = ax_par.text(0.03, 0.85, "", transform=ax_par.transAxes,
+                            ha="left", va="top", fontsize=9,
+                            color=_INFILL_C, fontweight="bold")
+
+    # ── Panel: Convergence history (bottom-right) ─────────────────────────────
+    ax_conv.set_title("Phase 3 · Convergence History", color=_WHITE,
+                      fontsize=10, fontweight="bold")
     ax_conv.set_xlabel("Generation", color=_MUTED, fontsize=8)
     ax_conv.grid(True, alpha=0.12, color=_WHITE)
+
     ax_conv2 = ax_conv.twinx()
     ax_conv2.set_facecolor(_BG_AX)
     _style_ax(ax_conv2)
 
-    conv_cl, = ax_conv.plot([], [], "-o", color=_ACCENT1, ms=2.5, lw=1.5,
-                             markerfacecolor=_ACCENT1, label="Max CL")
-    conv_cd, = ax_conv2.plot([], [], "-o", color=_ACCENT2, ms=2.5, lw=1.5,
-                              markerfacecolor=_ACCENT2, label="Min CD")
-
+    conv3_cl, = ax_conv.plot([], [], "-o", color=_ACCENT1, ms=2.5, lw=1.5)
+    conv3_cd, = ax_conv2.plot([], [], "-o", color=_ACCENT2, ms=2.5, lw=1.5)
     ax_conv.set_ylabel("Max CL",  color=_ACCENT1, fontsize=8)
     ax_conv2.set_ylabel("Min CD", color=_ACCENT2, fontsize=8)
     ax_conv.tick_params(axis="y",  colors=_ACCENT1, labelsize=7)
     ax_conv2.tick_params(axis="y", colors=_ACCENT2, labelsize=7)
-    ax_conv.set_xlim(1, n_gen)
 
-    if gen_best_cl:
-        _cl_lo = min(gen_best_cl) * 0.92
-        _cl_hi = max(gen_best_cl) * 1.08
-        _cd_lo = min(gen_best_cd) * 0.85
-        _cd_hi = max(gen_best_cd) * 1.15
-        ax_conv.set_ylim(_cl_lo, _cl_hi)
-        ax_conv2.set_ylim(_cd_lo, _cd_hi)
+    _all_cl_conv = gen3_best_cl + (gen4_best_cl if has_infill else [])
+    _all_cd_conv = gen3_best_cd + (gen4_best_cd if has_infill else [])
+    ax_conv.set_xlim(1, n_gen3 + (n_gen4 if has_infill else 0) + 1)
+    if _all_cl_conv:
+        ax_conv.set_ylim(min(_all_cl_conv) * 0.92, max(_all_cl_conv) * 1.08)
+        ax_conv2.set_ylim(min(_all_cd_conv) * 0.85, max(_all_cd_conv) * 1.15)
+
+    # Phase 4d refined convergence lines (dashed overlay)
+    conv4_cl, = ax_conv.plot([], [], "--s", color=_INFILL_C, ms=2.5, lw=1.2,
+                              alpha=0.0, label="Infill NSGA-II")
+    conv4_cd, = ax_conv2.plot([], [], "--s", color="#ffaa44", ms=2.5, lw=1.2,
+                               alpha=0.0)
+
+    # Divider line on convergence chart (shown at start of Phase 4d)
+    _infill_vline = ax_conv.axvline(x=0, color=_INFILL_C, lw=1.0, ls=":",
+                                     alpha=0.0)
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
 
-    # ── Update function ───────────────────────────────────────────────────────
-    def update(frame: int):
-        artists = [phase_lbl]
+    # ── update() ─────────────────────────────────────────────────────────────
+    def update(frame: int):  # noqa: C901
 
+        # ── Phase 1: DoE ─────────────────────────────────────────────────────
         if frame < _P1_END:
-            # ─ Phase 1: DoE ─────────────────────────────────────────────────
             n_shown = min((frame + 1) * _DOE_PER_FRAME, n_doe)
             phase_lbl.set_text(
                 f"Phase 1  ·  DoE Sampling  ({n_shown} / {n_doe} samples)"
@@ -271,63 +363,116 @@ def animate_workflow(
                 sizes = np.zeros(n_doe)
                 sizes[:n_shown] = 35
                 scat_doe.set_sizes(sizes)
-                scat_doe.set_edgecolors(
-                    np.where(sizes > 0, _WHITE, "none").reshape(-1)
-                    if False else _WHITE   # keep it simple
-                )
-                doe_count.set_text(f"{n_shown} / {n_doe} pts")
-                artists += [scat_doe, doe_count]
+                doe_count_lbl.set_text(f"{n_shown} / {n_doe} pts")
 
+        # ── Phase 2: ANN training ─────────────────────────────────────────────
         elif frame < _P2_END:
-            # ─ Phase 2: ANN training ─────────────────────────────────────────
             k = frame - _P1_END + 1
-            epoch_shown = k * (len(surrogate.loss_curve_CL_) // n_ann
-                               if n_ann > 0 else 1)
-            phase_lbl.set_text(
-                f"Phase 2  ·  ANN Training  (epoch {epoch_shown})"
-            )
+            epoch = k * _p2_step
+            phase_lbl.set_text(f"Phase 2  ·  ANN Training  (epoch {epoch})")
             xs = np.arange(k)
-            if line_cl is not None:
-                line_cl.set_data(xs, loss_cl[:k])
-                line_cd.set_data(xs, loss_cd[:k])
-                ann_lbl.set_text(f"epoch {epoch_shown}")
-                artists += [line_cl, line_cd, ann_lbl]
+            line_p2_cl.set_data(xs, p2_loss_cl[:k])
+            line_p2_cd.set_data(xs, p2_loss_cd[:k])
+            ann_epoch_lbl.set_text(f"epoch {epoch}")
 
-        else:
-            # ─ Phase 3: NSGA-II ──────────────────────────────────────────────
+        # ── Phase 3: NSGA-II ──────────────────────────────────────────────────
+        elif frame < _P3_END:
             g = frame - _P2_END
             phase_lbl.set_text(
-                f"Phase 3  ·  NSGA-II  (generation {g + 1} / {n_gen})"
+                f"Phase 3  ·  NSGA-II  (generation {g+1} / {n_gen3})"
             )
-            cl_arr, cd_arr = gen_pareto[g]
-            if len(cl_arr) > 0:
+            cl_arr, cd_arr = gen3_pareto[g]
+            if len(cl_arr):
                 order = np.argsort(cl_arr)
-                par_line.set_data(cd_arr[order], cl_arr[order])
-                par_scat.set_offsets(
-                    np.column_stack([cd_arr[order], cl_arr[order]])
-                )
-                par_scat.set_array(cl_arr[order])
-            gen_lbl.set_text(f"Gen {g + 1} / {n_gen}  |  {len(cl_arr)} pts")
+                par3_line.set_data(cd_arr[order], cl_arr[order])
+                par3_scat.set_offsets(np.c_[cd_arr[order], cl_arr[order]])
+                par3_scat.set_array(cl_arr[order])
+            gen3_lbl.set_text(f"Gen {g+1}/{n_gen3}  |  {len(cl_arr)} pts")
 
             gens = np.arange(1, g + 2)
-            conv_cl.set_data(gens, gen_best_cl[:g + 1])
-            conv_cd.set_data(gens, gen_best_cd[:g + 1])
-            artists += [par_line, par_scat, gen_lbl, conv_cl, conv_cd]
+            conv3_cl.set_data(gens, gen3_best_cl[:g+1])
+            conv3_cd.set_data(gens, gen3_best_cd[:g+1])
 
-        return artists
+        # ── Phase 4a: Infill – highlight candidates on Pareto front ───────────
+        elif has_infill and frame < _P4a_END:
+            k = frame - _P3_END + 1        # 1 … n_cand
+            phase_lbl.set_text(
+                f"Phase 4a  ·  Infill: Selecting top {k} / {n_cand} candidates"
+            )
+            # Fade Phase 3 Pareto and show selected candidates (ANN positions)
+            par3_scat.set_alpha(0.25)
+            par3_line.set_alpha(0.2)
+            scat_cand_ann.set_offsets(np.c_[CD_ann[:k], CL_ann[:k]])
 
-    # ── Render and save ───────────────────────────────────────────────────────
-    anim = FuncAnimation(
-        fig, update,
-        frames=total,
-        interval=1000 // fps,
-        blit=False,
-    )
+        # ── Phase 4b: Infill – CFD re-evaluation ─────────────────────────────
+        elif has_infill and frame < _P4b_END:
+            k = frame - _P4a_END + 1        # 1 … n_cand
+            phase_lbl.set_text(
+                f"Phase 4b  ·  Infill: CFD re-evaluation  ({k} / {n_cand})"
+            )
+            # Add infill star to DoE panel
+            scat_infill_doe.set_offsets(
+                np.c_[X_cand[:k, 1], X_cand[:k, 2]]   # camber, thickness
+            )
+            scat_infill_doe.set_array(CL_cfd[:k])
 
+            # Show CFD results (filled stars) alongside ANN diamonds
+            scat_cand_cfd.set_offsets(np.c_[CD_cfd[:k], CL_cfd[:k]])
+            scat_cand_cfd.set_array(CL_cfd[:k])
+
+        # ── Phase 4c: Infill – ANN retraining ────────────────────────────────
+        elif has_infill and has_retrain and frame < _P4c_END:
+            k = frame - _P4b_END + 1
+            epoch = k * _p4c_step
+            phase_lbl.set_text(
+                f"Phase 4c  ·  Infill: ANN Retraining  (epoch {epoch})"
+            )
+            xs = np.arange(k)
+            # Expand x-axis to fit retrained epochs alongside original
+            ax_ann.set_xlim(0, max(n_p2, n_p4c))
+            line_r4_cl.set_data(xs, p4c_loss_cl[:k])
+            line_r4_cd.set_data(xs, p4c_loss_cd[:k])
+            line_r4_cl.set_alpha(0.95)
+            line_r4_cd.set_alpha(0.95)
+            ann_epoch_lbl.set_text(f"retrain epoch {epoch}")
+            ax_ann.set_title("Phase 2 & 4c · ANN Training Loss",
+                             color=_WHITE, fontsize=10, fontweight="bold")
+
+        # ── Phase 4d: Refined NSGA-II ─────────────────────────────────────────
+        elif has_infill:
+            g = frame - _P4c_END
+            phase_lbl.set_text(
+                f"Phase 4d  ·  Infill NSGA-II  (generation {g+1} / {n_gen4})"
+            )
+            cl_arr4, cd_arr4 = gen4_pareto[g]
+            if len(cl_arr4):
+                order4 = np.argsort(cl_arr4)
+                par4_line.set_data(cd_arr4[order4], cl_arr4[order4])
+                par4_scat.set_offsets(np.c_[cd_arr4[order4], cl_arr4[order4]])
+                par4_scat.set_array(cl_arr4[order4])
+                par4_line.set_alpha(0.85)
+                par4_scat.set_alpha(0.85)
+            gen4_lbl.set_text(f"Infill Gen {g+1}/{n_gen4}  |  {len(cl_arr4)} pts")
+            ax_par.set_title("Phase 4d · Refined Pareto Front", color=_WHITE,
+                             fontsize=10, fontweight="bold")
+
+            # Append refined convergence to chart; offset x by n_gen3
+            gens4 = np.arange(n_gen3 + 1, n_gen3 + g + 2)
+            conv4_cl.set_data(gens4, gen4_best_cl[:g+1])
+            conv4_cd.set_data(gens4, gen4_best_cd[:g+1])
+            conv4_cl.set_alpha(0.9)
+            conv4_cd.set_alpha(0.9)
+            if g == 0:
+                _infill_vline.set_xdata([n_gen3 + 0.5, n_gen3 + 0.5])
+                _infill_vline.set_alpha(0.6)
+            ax_conv.set_title("Phase 4d · Convergence (Phase 3 + Infill)",
+                              color=_WHITE, fontsize=10, fontweight="bold")
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    anim = FuncAnimation(fig, update, frames=total, interval=1000 // fps, blit=False)
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".",
                 exist_ok=True)
     print(f"[viz] Rendering animation ({total} frames @ {fps} fps) …")
-    writer = PillowWriter(fps=fps)
-    anim.save(save_path, writer=writer, dpi=110)
+    anim.save(save_path, writer=PillowWriter(fps=fps), dpi=110)
     plt.close(fig)
     print(f"[viz] Workflow animation saved → {save_path}")
