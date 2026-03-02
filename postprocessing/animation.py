@@ -117,8 +117,11 @@ def animate_workflow(
 
     has_ann = len(_raw_cl_p2) > 0
     if has_ann:
-        p2_loss_cl, _p2_step = _subsample(_raw_cl_p2, _MAX_ANN)
-        p2_loss_cd, _        = _subsample(_raw_cd_p2, _MAX_ANN)
+        # Truncate to the shorter curve so CL and CD always have equal length
+        # (the two MLPRegressors may converge at slightly different iterations)
+        _min_p2 = min(len(_raw_cl_p2), len(_raw_cd_p2))
+        p2_loss_cl, _p2_step = _subsample(_raw_cl_p2[:_min_p2], _MAX_ANN)
+        p2_loss_cd           = _raw_cd_p2[:_min_p2][::_p2_step]
         n_p2 = len(p2_loss_cl)
     else:
         n_p2 = 0
@@ -152,8 +155,9 @@ def animate_workflow(
         _raw_cd_r4 = np.array(infill_data.get("loss_cd_retrain", []))
         has_retrain = len(_raw_cl_r4) > 0
         if has_retrain:
-            p4c_loss_cl, _p4c_step = _subsample(_raw_cl_r4, _MAX_ANN)
-            p4c_loss_cd, _         = _subsample(_raw_cd_r4, _MAX_ANN)
+            _min_r4 = min(len(_raw_cl_r4), len(_raw_cd_r4))
+            p4c_loss_cl, _p4c_step = _subsample(_raw_cl_r4[:_min_r4], _MAX_ANN)
+            p4c_loss_cd            = _raw_cd_r4[:_min_r4][::_p4c_step]
             n_p4c = len(p4c_loss_cl)
         else:
             n_p4c = 0
@@ -286,9 +290,15 @@ def animate_workflow(
 
     cl_vmax_par = max(gen3_best_cl + (gen4_best_cl if has_infill else [])) if gen3_best_cl else 2.0
 
-    # Phase 3 Pareto artists
+    # Pre-compute max Pareto sizes for NaN-padding (avoids shape-mismatch in FuncAnimation)
+    _max_par3 = max((len(cl) for cl, _ in gen3_pareto if len(cl) > 0), default=1)
+    _max_par4 = max((len(cl) for cl, _ in gen4_pareto if len(cl) > 0), default=1) if has_infill else 1
+
+    # Phase 3 Pareto artists – initialised with NaN so size is fixed
     par3_line, = ax_par.plot([], [], "--", color="#555577", lw=0.8, zorder=2)
-    par3_scat  = ax_par.scatter([], [], c=[], cmap="plasma", s=45, zorder=3,
+    _par3_xy0  = np.full((_max_par3, 2), np.nan)
+    par3_scat  = ax_par.scatter(_par3_xy0[:, 0], _par3_xy0[:, 1],
+                                 c=np.zeros(_max_par3), cmap="plasma", s=45, zorder=3,
                                  edgecolors=_WHITE, linewidths=0.3,
                                  vmin=0, vmax=cl_vmax_par)
     gen3_lbl = ax_par.text(0.03, 0.97, "", transform=ax_par.transAxes,
@@ -307,7 +317,9 @@ def animate_workflow(
     # Phase 4d Pareto artists (overlay refined run)
     par4_line, = ax_par.plot([], [], "--", color="#ff9966", lw=0.8, zorder=4,
                               alpha=0.0)
-    par4_scat  = ax_par.scatter([], [], c=[], cmap="inferno", s=45, zorder=5,
+    _par4_xy0  = np.full((_max_par4, 2), np.nan)
+    par4_scat  = ax_par.scatter(_par4_xy0[:, 0], _par4_xy0[:, 1],
+                                 c=np.zeros(_max_par4), cmap="inferno", s=45, zorder=5,
                                  edgecolors=_WHITE, linewidths=0.3, alpha=0.0,
                                  vmin=0, vmax=cl_vmax_par)
     gen4_lbl = ax_par.text(0.03, 0.85, "", transform=ax_par.transAxes,
@@ -384,9 +396,14 @@ def animate_workflow(
             cl_arr, cd_arr = gen3_pareto[g]
             if len(cl_arr):
                 order = np.argsort(cl_arr)
+                n3 = len(cl_arr)
+                xy3 = np.full((_max_par3, 2), np.nan)
+                xy3[:n3] = np.c_[cd_arr[order], cl_arr[order]]
+                c3 = np.zeros(_max_par3)
+                c3[:n3] = cl_arr[order]
                 par3_line.set_data(cd_arr[order], cl_arr[order])
-                par3_scat.set_offsets(np.c_[cd_arr[order], cl_arr[order]])
-                par3_scat.set_array(cl_arr[order])
+                par3_scat.set_offsets(xy3)
+                par3_scat.set_array(c3)
             gen3_lbl.set_text(f"Gen {g+1}/{n_gen3}  |  {len(cl_arr)} pts")
 
             gens = np.arange(1, g + 2)
@@ -447,9 +464,14 @@ def animate_workflow(
             cl_arr4, cd_arr4 = gen4_pareto[g]
             if len(cl_arr4):
                 order4 = np.argsort(cl_arr4)
+                n4 = len(cl_arr4)
+                xy4 = np.full((_max_par4, 2), np.nan)
+                xy4[:n4] = np.c_[cd_arr4[order4], cl_arr4[order4]]
+                c4 = np.zeros(_max_par4)
+                c4[:n4] = cl_arr4[order4]
                 par4_line.set_data(cd_arr4[order4], cl_arr4[order4])
-                par4_scat.set_offsets(np.c_[cd_arr4[order4], cl_arr4[order4]])
-                par4_scat.set_array(cl_arr4[order4])
+                par4_scat.set_offsets(xy4)
+                par4_scat.set_array(c4)
                 par4_line.set_alpha(0.85)
                 par4_scat.set_alpha(0.85)
             gen4_lbl.set_text(f"Infill Gen {g+1}/{n_gen4}  |  {len(cl_arr4)} pts")
