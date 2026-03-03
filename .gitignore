@@ -16,7 +16,6 @@ wheels/
 nohup.out
 cortexerror.log
 *.log
-results/
 
 # Fluent cleanup scripts (auto-generated)
 cleanup-fluent-*.sh
